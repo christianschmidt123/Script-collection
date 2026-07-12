@@ -1,0 +1,91 @@
+# Board: AZ-Delivery ESP32 Dev Kit C V4 + AZ-Touch MOD (Version 01-03), 2.4" ILI9341
+#
+# Hinweis (Stand Juli 2026): Der Display-Treiber "ili9xxx" ist im aktuellen
+# ESPHome zwar als "deprecated" markiert (Nachfolger: mipi_spi), funktioniert
+# aber weiterhin. Der neue mipi_spi-Treiber hatte in mehreren Releases
+# (2026.4 / 2026.5 / 2026.6 / 2026.6.1) reproduzierbare Regressionen speziell
+# bei ILI9341-Displays (verzerrtes Bild, "Invalid offsets", weißer Screen).
+# => Solange bewusst NICHT auf mipi_spi umsteigen, bis die Bugs im Upstream
+#    behoben sind. ili9xxx bleibt vorerst die stabilere Wahl.
+# Bei einem Problem mit einem weißem Bildschirm, die Abstandshalter vom ESP32 entfernen oder die Pins tiefer drücken!
+
+esphome:
+  name: az-touch-display-1
+  friendly_name: AZ Touch Display 1
+
+esp32:
+  board: esp32dev   # Alternativ: az-delivery-devkit-v4 (im HA-Forum für exakt
+                     # dieses Board verifiziert) - beide funktionieren.
+  framework:
+    type: arduino
+    advanced:
+      minimum_chip_revision: "3.1"
+      # ACHTUNG Brick-Risiko: sram1_as_iram spart ~40KB IRAM, benötigt aber
+      # einen Bootloader ab ESP-IDF 5.1. Ist der Bootloader älter, bootet das
+      # Gerät danach nicht mehr und muss per USB neu geflasht werden.
+      # -> Beim ERSTEN Aktivieren zwingend per USB flashen, NICHT per OTA!
+      sram1_as_iram: true
+
+logger:
+  level: DEBUG
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# --- SPI-Bus ---
+# WICHTIG: In der ursprünglichen YAML waren mosi_pin/miso_pin vertauscht!
+# Laut eigener Hardware-Analyse: MISO = GPIO19, MOSI = GPIO23.
+spi:
+  clk_pin: GPIO18
+  mosi_pin: GPIO23   # MOSI / SDI (Daten zum Display)
+  miso_pin: GPIO19   # MISO / SDO (nur relevant, falls später Touch dazukommt)
+
+# --- Farben ---
+color:
+  - id: my_color_black
+    red: 0%
+    green: 0%
+    blue: 0%
+  - id: my_color_white
+    red: 100%
+    green: 100%
+    blue: 100%
+
+font:
+  - id: my_font
+    file: "gfonts://Roboto"
+    size: 20
+
+display:
+  - platform: ili9xxx
+    model: ILI9341
+    cs_pin: GPIO5
+    dc_pin: GPIO4
+    reset_pin: GPIO22
+    data_rate: 4MHz
+    color_palette: 8BIT
+    color_order: BGR
+    invert_colors: false
+    rotation: 90
+    show_test_card: true   # <- vorübergehend, ersetzt die pages/lambda
+# --- Backlight: sauberer über inverted:true + light-Komponente ---
+# (statt manuellem on_boot output.turn_off, das nur zufällig funktioniert,
+# weil "turn_off" bei GPIO ohne inverted-Flag = LOW zieht)
+output:
+  - platform: ledc
+    pin: GPIO15
+    id: backlight_pwm
+    inverted: true   # PNP-Transistor (BC807-40): LOW = an, HIGH = aus
+
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    name: "Display Backlight"
+    id: back_light
+    restore_mode: ALWAYS_ON   # sorgt dafür, dass es beim Boot angeht
