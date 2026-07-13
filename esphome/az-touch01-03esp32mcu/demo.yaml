@@ -1,0 +1,215 @@
+# Board: AZ-Delivery ESP32 Dev Kit C V4 + AZ-Touch MOD (01-03), 2.4" ILI9341 + XPT2046 Touch
+# Steuert Home Assistant Entities direkt vom Touchscreen aus.
+
+esphome:
+  name: az-touch-display-1
+  friendly_name: AZ Touch Display 1
+  on_boot:
+    priority: 600
+    then:
+      - lambda: |-
+          // Cold-Boot-Workaround: verhindert "weiß nach Kaltstart"
+          if (!id(cold_boot_handled) && esp_reset_reason() == ESP_RST_POWERON) {
+            id(cold_boot_handled) = true;
+            delay(2000);
+            App.safe_reboot();
+          }
+
+globals:
+  - id: cold_boot_handled
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+    advanced:
+      minimum_chip_revision: "3.1"
+      sram1_as_iram: true   # Nur wenn per USB (nicht OTA) initial geflasht!
+
+logger:
+  level: DEBUG
+
+api:
+  encryption:
+    key: !secret api_encryption_key   # in secrets.yaml eintragen, siehe Text unten
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+time:
+  - platform: sntp
+    id: my_time
+
+# --- SPI-Bus (Display + Touch teilen sich den Bus) ---
+spi:
+  id: spi_bus
+  clk_pin: GPIO18
+  mosi_pin: GPIO23
+  miso_pin: GPIO19
+
+# --- Display ---
+display:
+  - platform: ili9xxx
+    id: my_display
+    model: ILI9341
+    cs_pin:
+      number: GPIO5
+      ignore_strapping_warning: true
+    dc_pin: GPIO4
+    reset_pin: GPIO22
+    data_rate: 4MHz
+    color_palette: 8BIT      # zwingend ohne PSRAM
+    color_order: BGR
+    invert_colors: false
+    update_interval: never    # LVGL steuert die Updates selbst
+
+# --- Touchscreen ---
+# ACHTUNG: cs_pin für Touch (GPIO14) stammt aus einem Community-Beispiel für
+# exakt dieses Board (01-03). Falls Touch nicht reagiert oder die Achsen
+# vertauscht/gespiegelt sind, siehe Kalibrier-Hinweise unten.
+touchscreen:
+  platform: xpt2046
+  id: my_touch
+  spi_id: spi_bus
+  cs_pin: GPIO14
+  update_interval: 50ms
+  calibration:
+    x_min: 216
+    x_max: 3892
+    y_min: 236
+    y_max: 3908
+  transform:
+    swap_xy: false
+    mirror_x: false
+    mirror_y: false
+
+# --- Backlight (dimmbar, als HA-Licht-Entity) ---
+output:
+  - platform: ledc
+    pin: GPIO15
+    id: backlight_pwm
+    inverted: true
+
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    name: "Display Backlight"
+    id: back_light
+    restore_mode: ALWAYS_ON
+
+# --- Reboot-Knopf, auch aus HA nutzbar ---
+button:
+  - platform: restart
+    name: "AZ-Touch Neustart"
+    id: restart_button
+
+# --- Werte aus Home Assistant ziehen (Push, aktualisiert automatisch) ---
+sensor:
+  - platform: homeassistant
+    id: ha_chris_temp
+    entity_id: sensor.alpstuga_air_quality_monitor_temperatur_2  
+    internal: true
+
+text_sensor:
+  - platform: homeassistant
+    id: ha_licht_whiskey_state
+    entity_id: light.kajplats_e14_ws_globe_806lm
+    internal: true
+
+# --- LVGL Touch-Oberfläche ---
+lvgl:
+  displays:
+    - my_display
+  touchscreens:
+    - my_touch
+  rotation: 90
+  buffer_size: 25%          # kleiner Zeichenpuffer, wichtig ohne PSRAM
+  pages:
+    - id: main_page
+      widgets:
+        - label:
+            text: "AZ-Touch Steuerung"
+            align: TOP_MID
+            y: 10
+            text_font: montserrat_20
+
+        - label:
+            id: clock_label
+            align: TOP_RIGHT
+            x: -10
+            y: 12
+            text_font: montserrat_14
+            text: "--:--"
+
+        - label:
+            id: temp_label
+            align: TOP_LEFT
+            x: 10
+            y: 40
+            text_font: montserrat_14
+            text: "Temp: --"
+
+        - button:
+            x: 20
+            y: 80
+            width: 130
+            height: 60
+            widgets:
+              - label:
+                  text: "Licht\nWhiskey"
+                  text_align: CENTER
+            on_press:
+              - homeassistant.service:
+                  service: light.toggle
+                  data:
+                    entity_id: light.kajplats_e14_ws_globe_806lm
+
+        - button:
+            x: 170
+            y: 80
+            width: 130
+            height: 60
+            widgets:
+              - label:
+                  text: "Backlight\nan/aus"
+                  text_align: CENTER
+            on_press:
+              - light.toggle: back_light
+
+        - button:
+            x: 20
+            y: 160
+            width: 280
+            height: 50
+            widgets:
+              - label:
+                  text: "Neustart"
+                  text_align: CENTER
+            on_press:
+              - button.press: restart_button
+
+# --- Interval: Uhr & HA-Werte in die Labels schreiben ---
+interval:
+  - interval: 1s
+    then:
+      - lvgl.label.update:
+          id: clock_label
+          text: !lambda 'return id(my_time).now().strftime("%H:%M");'
+  - interval: 5s
+    then:
+      - lvgl.label.update:
+          id: temp_label
+          text: !lambda |-
+            if (id(ha_chris_temp).has_state()) {
+              char buf[20];
+              snprintf(buf, sizeof(buf), "Temp: %.1f°C", id(ha_chris_temp).state);
+              return std::string(buf);
+            }
+            return std::string("Temp: --");
