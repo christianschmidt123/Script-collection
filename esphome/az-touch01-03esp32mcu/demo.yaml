@@ -1,12 +1,42 @@
 # Board: AZ-Delivery ESP32 Dev Kit C V4 + AZ-Touch MOD (01-03), 2.4" ILI9341 + XPT2046 Touch
-# Steuert Home Assistant Entities direkt vom Touchscreen aus.
+# Dark-Mode-Dashboard im HA-Look, gesteuert direkt vom Touchscreen aus.
+
+# ---------------------------------------------------------------------------
+# Alles, was du regelmäßig anpassen willst, steht HIER zentral.
+# Entity-IDs ändern -> speichern -> im ESPHome-Builder "Installieren" (OTA).
+# ACHTUNG: Hier wird der Buzzer noch sehr heiß!
+# ---------------------------------------------------------------------------
+substitutions:
+  device_name: "az-touch-display-1"
+  friendly_name: "AZ Touch Display 1"
+
+  # Entitäten, die auf dem Display gesteuert/angezeigt werden
+  light_1_entity: "light.kajplats_e14_ws_globe_806lm"
+  light_1_label: "Licht Whiskey"
+  temp_1_entity: "sensor.alpstuga_air_quality_monitor_temperatur_2"
+  temp_1_label: "Temperatur"
+
+  # HA-Dark-Theme-Farben (Standardpalette)
+  color_bg: "0x111111"
+  color_card: "0x1C1C1C"
+  color_primary: "0x03A9F4"
+  color_text: "0xE1E1E1"
+  color_text_secondary: "0x8A8A8A"
 
 esphome:
-  name: az-touch-display-1
-  friendly_name: AZ Touch Display 1
+  name: ${device_name}
+  friendly_name: ${friendly_name}
   on_boot:
-    priority: 600
+    priority: 800
     then:
+      - output.turn_off: buzzer_pin
+      - if:
+          condition:
+            lambda: 'return !id(touch_calibrated_once);'
+          then:
+            - lambda: |-
+                id(touch_calibrated_once) = true;
+                ESP_LOGI("touch_cal", "Einmalige Touch-Prüfung aktiv");
       - lambda: |-
           // Cold-Boot-Workaround: verhindert "weiß nach Kaltstart"
           if (!id(cold_boot_handled) && esp_reset_reason() == ESP_RST_POWERON) {
@@ -21,20 +51,25 @@ globals:
     restore_value: false
     initial_value: 'false'
 
+  - id: touch_calibrated_once
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+
 esp32:
   board: esp32dev
   framework:
     type: arduino
     advanced:
       minimum_chip_revision: "3.1"
-      sram1_as_iram: true   # Nur wenn per USB (nicht OTA) initial geflasht!
+      sram1_as_iram: true
 
 logger:
   level: DEBUG
 
 api:
   encryption:
-    key: !secret api_encryption_key   # in secrets.yaml eintragen, siehe Text unten
+    key: !secret api_encryption_key
 
 ota:
   - platform: esphome
@@ -47,14 +82,12 @@ time:
   - platform: sntp
     id: my_time
 
-# --- SPI-Bus (Display + Touch teilen sich den Bus) ---
 spi:
   id: spi_bus
   clk_pin: GPIO18
   mosi_pin: GPIO23
   miso_pin: GPIO19
 
-# --- Display ---
 display:
   - platform: ili9xxx
     id: my_display
@@ -65,15 +98,11 @@ display:
     dc_pin: GPIO4
     reset_pin: GPIO22
     data_rate: 4MHz
-    color_palette: 8BIT      # zwingend ohne PSRAM
+    color_palette: 8BIT
     color_order: BGR
     invert_colors: false
-    update_interval: never    # LVGL steuert die Updates selbst
+    update_interval: never
 
-# --- Touchscreen ---
-# ACHTUNG: cs_pin für Touch (GPIO14) stammt aus einem Community-Beispiel für
-# exakt dieses Board (01-03). Falls Touch nicht reagiert oder die Achsen
-# vertauscht/gespiegelt sind, siehe Kalibrier-Hinweise unten.
 touchscreen:
   platform: xpt2046
   id: my_touch
@@ -86,16 +115,32 @@ touchscreen:
     y_min: 236
     y_max: 3908
   transform:
-    swap_xy: false
-    mirror_x: false
+    swap_xy: false   # LVGL rotation:90 übernimmt die Achsen-Vertauschung intern
+    mirror_x: true
     mirror_y: false
+  on_touch:
+    - logger.log:
+        format: "Touch gemappt x=%d y=%d (raw x=%d y=%d)"
+        args: ['touch.x', 'touch.y', 'touch.x_raw', 'touch.y_raw']
+    - if:
+        condition:
+          lambda: 'return id(touch_calibrated_once);'
+        then:
+          - lambda: |-
+              ESP_LOGD("touch_cal", "Touch ist bereits einmalig initialisiert.");
 
-# --- Backlight (dimmbar, als HA-Licht-Entity) ---
 output:
   - platform: ledc
     pin: GPIO15
     id: backlight_pwm
     inverted: true
+
+  - platform: gpio
+    id: buzzer_pin
+    pin:
+      number: GPIO21
+      mode: OUTPUT
+      inverted: true   # Pin-Low = Buzzer aus; verhindert ungewolltes Anschalten beim Boot
 
 light:
   - platform: monochromatic
@@ -104,112 +149,221 @@ light:
     id: back_light
     restore_mode: ALWAYS_ON
 
-# --- Reboot-Knopf, auch aus HA nutzbar ---
 button:
   - platform: restart
     name: "AZ-Touch Neustart"
     id: restart_button
 
-# --- Werte aus Home Assistant ziehen (Push, aktualisiert automatisch) ---
 sensor:
   - platform: homeassistant
-    id: ha_chris_temp
-    entity_id: sensor.alpstuga_air_quality_monitor_temperatur_2  
+    id: ha_temp_1
+    entity_id: ${temp_1_entity}
     internal: true
 
 text_sensor:
   - platform: homeassistant
-    id: ha_licht_whiskey_state
-    entity_id: light.kajplats_e14_ws_globe_806lm
-    internal: true
+    id: ha_light_1_state
+    entity_id: ${light_1_entity}
+    on_value:
+      then:
+        - lvgl.widget.update:
+            id: light_1_switch
+            state:
+              checked: !lambda 'return x == "on";'
 
-# --- LVGL Touch-Oberfläche ---
+font:
+  - file: "fonts/materialdesignicons-webfont.ttf"
+    id: mdi_16
+    size: 16
+    bpp: 4
+    glyphs:
+      - "\U000F050F"
+      - "\U000F0335"
+      - "\U000F00DB"
+
 lvgl:
   displays:
     - my_display
   touchscreens:
     - my_touch
   rotation: 90
-  buffer_size: 25%          # kleiner Zeichenpuffer, wichtig ohne PSRAM
+  buffer_size: 25%
+  bg_color: ${color_bg}
+
+  style_definitions:
+    - id: card_style
+      bg_color: ${color_card}
+      bg_opa: COVER
+      radius: 14
+      border_width: 0
+      pad_all: 12
+      shadow_width: 0
+
+    - id: row_style
+      bg_opa: TRANSP
+      border_width: 0
+      pad_all: 4
+
+  top_layer:
+    widgets:
+      - label:
+          id: clock_label
+          align: TOP_RIGHT
+          x: -10
+          y: 6
+          text_font: montserrat_14
+          text_color: ${color_text_secondary}
+          text: "--:--"
+
   pages:
     - id: main_page
+      bg_color: ${color_bg}
       widgets:
         - label:
-            text: "AZ-Touch Steuerung"
-            align: TOP_MID
-            y: 10
-            text_font: montserrat_20
-
-        - label:
-            id: clock_label
-            align: TOP_RIGHT
-            x: -10
-            y: 12
-            text_font: montserrat_14
-            text: "--:--"
-
-        - label:
-            id: temp_label
+            text: "Zuhause"
             align: TOP_LEFT
             x: 10
+            y: 6
+            text_font: montserrat_20
+            text_color: ${color_text}
+
+        - obj:
+            styles: card_style
+            x: 10
             y: 40
-            text_font: montserrat_14
-            text: "Temp: --"
-
-        - button:
-            x: 20
-            y: 80
-            width: 130
-            height: 60
+            width: 300
+            height: 150
+            layout:
+              type: FLEX
+              flex_flow: COLUMN
+              pad_row: 10
             widgets:
-              - label:
-                  text: "Licht\nWhiskey"
-                  text_align: CENTER
-            on_press:
-              - homeassistant.service:
-                  service: light.toggle
-                  data:
-                    entity_id: light.kajplats_e14_ws_globe_806lm
+              - obj:
+                  styles: row_style
+                  width: 100%
+                  height: 30
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    pad_column: 8
+                  widgets:
+                    - label:
+                        text: "\U000F050F"
+                        text_font: mdi_16
+                        text_color: ${color_text}
+                    - label:
+                        text: "${temp_1_label}"
+                        text_color: ${color_text}
+                        text_font: montserrat_14
+                        flex_grow: 1
+                    - label:
+                        id: temp_1_label_widget
+                        text: "--"
+                        text_color: ${color_primary}
+                        text_font: montserrat_14
+
+              - obj:
+                  styles: row_style
+                  width: 100%
+                  height: 40
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    pad_column: 8
+                  widgets:
+                    - label:
+                        text: "\U000F0335"
+                        text_font: mdi_16
+                        text_color: ${color_text}
+                    - label:
+                        text: "${light_1_label}"
+                        text_color: ${color_text}
+                        text_font: montserrat_14
+                        flex_grow: 1
+                    - switch:
+                        id: light_1_switch
+                        width: 50
+                        height: 26
+                        on_change:
+                          then:
+                            - if:
+                                condition:
+                                  lambda: 'return x;'
+                                then:
+                                  - homeassistant.service:
+                                      service: light.turn_on
+                                      data:
+                                        entity_id: ${light_1_entity}
+                                else:
+                                  - homeassistant.service:
+                                      service: light.turn_off
+                                      data:
+                                        entity_id: ${light_1_entity}
+
+              - obj:
+                  styles: row_style
+                  width: 100%
+                  height: 40
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    pad_column: 8
+                  widgets:
+                    - label:
+                        text: "\U000F00DB"
+                        text_font: mdi_16
+                        text_color: ${color_text}
+                    - label:
+                        text: "Backlight"
+                        text_color: ${color_text}
+                        text_font: montserrat_14
+                        flex_grow: 1
+                    - switch:
+                        id: backlight_switch
+                        width: 50
+                        height: 26
+                        state:
+                          checked: true
+                        on_change:
+                          then:
+                            - if:
+                                condition:
+                                  lambda: 'return x;'
+                                then:
+                                  - light.turn_on: back_light
+                                else:
+                                  - light.turn_off: back_light
 
         - button:
-            x: 170
-            y: 80
-            width: 130
-            height: 60
-            widgets:
-              - label:
-                  text: "Backlight\nan/aus"
-                  text_align: CENTER
-            on_press:
-              - light.toggle: back_light
-
-        - button:
-            x: 20
-            y: 160
-            width: 280
-            height: 50
+            x: 10
+            y: 210
+            width: 300
+            height: 40
+            bg_color: ${color_card}
             widgets:
               - label:
                   text: "Neustart"
+                  text_color: ${color_text_secondary}
+                  text_font: montserrat_14
                   text_align: CENTER
             on_press:
               - button.press: restart_button
 
-# --- Interval: Uhr & HA-Werte in die Labels schreiben ---
 interval:
   - interval: 1s
     then:
       - lvgl.label.update:
           id: clock_label
           text: !lambda 'return id(my_time).now().strftime("%H:%M");'
+
   - interval: 5s
     then:
       - lvgl.label.update:
-          id: temp_label
+          id: temp_1_label_widget
           text: !lambda |-
-            if (id(ha_chris_temp).has_state()) {
-              char buf[20];
-              snprintf(buf, sizeof(buf), "Temp: %.1f°C", id(ha_chris_temp).state);
+            if (id(ha_temp_1).has_state()) {
+              char buf[16];
+              snprintf(buf, sizeof(buf), "%.1f°C", id(ha_temp_1).state);
               return std::string(buf);
             }
-            return std::string("Temp: --");
+            return std::string("--");
