@@ -118,16 +118,23 @@ select_printer() {
 # ---------------------------------------------------------------------------
 install_dependencies
 
-# ImageMagick-Befehl ermitteln
+# ImageMagick-Befehl ermitteln (v7 = magick, v6 = separate montage-Binary)
 if command -v magick &>/dev/null; then
     MAGICK_CMD="magick"
+    MONTAGE_CMD="magick montage"
 else
     MAGICK_CMD="convert"
+    MONTAGE_CMD="montage"
 fi
 
-# Quellordner
-read -rp "Ordner mit den druckfertigen Fotos (Enter = aktueller Ordner): " SRC_DIR
-SRC_DIR="${SRC_DIR:-.}"
+# Quellordner (env-Variable PHOTO_SRC_DIR hat Vorrang)
+if [ -n "${PHOTO_SRC_DIR:-}" ]; then
+    SRC_DIR="$PHOTO_SRC_DIR"
+    echo "Quellordner (aus Workflow): $SRC_DIR"
+else
+    read -rp "Ordner mit den druckfertigen Fotos (Enter = aktueller Ordner): " SRC_DIR
+    SRC_DIR="${SRC_DIR:-.}"
+fi
 if [ ! -d "$SRC_DIR" ]; then
     echo "FEHLER: Ordner '$SRC_DIR' nicht gefunden."
     exit 1
@@ -209,13 +216,12 @@ for ((page=0; page<NUM_PAGES; page++)); do
     OUT_FILE="$TMP_DIR/seite_$(printf '%04d' $((page+1))).tiff"
     echo "Erstelle Seite $((page+1))/$NUM_PAGES ..."
 
-    $MAGICK_CMD montage "${PAGE_PHOTOS[@]}" \
+    $MONTAGE_CMD "${PAGE_PHOTOS[@]}" \
         -geometry "${PHOTO_PX_W}x${PHOTO_PX_H}+0+0" \
         -tile "${COLS}x${ROWS}" \
         -background white \
         -density "$DPI" \
         -units PixelsPerInch \
-        -resize "${PAPER_PX_W}x${PAPER_PX_H}" \
         "$OUT_FILE"
 
     PRINT_FILES+=("$OUT_FILE")

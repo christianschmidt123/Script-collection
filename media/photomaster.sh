@@ -76,7 +76,7 @@ menu_print() {
 }
 
 # ---------------------------------------------------------------------------
-# Untermenü: Kompletter Workflow (alle Schritte nacheinander)
+# Untermenü: Kompletter Workflow (alle Schritte nacheinander, Ordner gekettet)
 # ---------------------------------------------------------------------------
 menu_full_workflow() {
     clear
@@ -84,30 +84,50 @@ menu_full_workflow() {
     echo "  🔄  Kompletter Workflow"
     line
     echo ""
-    echo "Schritt 1: Farbkorrektur"
-    echo "Schritt 2: Skalierung auf Druckformat"
-    echo "Schritt 3: Platzsparender Druck"
-    echo ""
-    echo "Hinweis: Jedes Skript fragt dich nach dem passenden Ordner."
-    echo "Starte Schritt 1 zuerst, dann gib den Ausgabeordner"
-    echo "('druckbereit') als Eingabe für Schritt 2 an."
+    echo "Schritt 1: Farbkorrektur  → Ausgabe in '<quellordner>/druckbereit/'"
+    echo "Schritt 2: Skalierung     → Eingabe: 'druckbereit/', Ausgabe: 'druckbereit/skaliert_*/'"
+    echo "Schritt 3: Druck          → Eingabe: skalierter Ordner aus Schritt 2"
     echo ""
     read -rp "Workflow starten? [j/N]: " confirm
     if [[ ! "$confirm" =~ ^[jJyY]$ ]]; then
         return
     fi
 
+    # --- Schritt 1: Farbkorrektur ---
     echo ""
     echo "══ Schritt 1/3: Farbkorrektur ══════════════════════════"
-    menu_correction
+    read -rp "Quellordner mit Originalfotos (Enter = aktueller Ordner): " SRC_ORIG
+    SRC_ORIG="${SRC_ORIG:-.}"
+    if [ ! -d "$SRC_ORIG" ]; then
+        echo "FEHLER: Ordner '$SRC_ORIG' nicht gefunden."
+        read -rp "Weiter mit Enter ..."
+        return
+    fi
+    (cd "$SRC_ORIG" && bash "$SCRIPT_DIR/photoprintcorrection.sh")
+    CORRECTION_OUT="$(realpath "$SRC_ORIG")/druckbereit"
+    echo ""
+    echo "✓ Farbkorrektur abgeschlossen. Ergebnis: $CORRECTION_OUT"
+    read -rp "Weiter mit Enter ..."
 
+    # --- Schritt 2: Skalierung (PHOTO_SRC_DIR gesetzt → kein manueller Quellordner-Prompt) ---
     echo ""
     echo "══ Schritt 2/3: Skalierung ═════════════════════════════"
-    menu_resize
+    PHOTO_SRC_DIR="$CORRECTION_OUT" bash "$SCRIPT_DIR/photoresize.sh"
 
+    # Letzten erstellten skaliert_*-Ordner ermitteln
+    RESIZE_OUT=$(ls -dt "$CORRECTION_OUT"/skaliert_* 2>/dev/null | head -1)
+    RESIZE_OUT="${RESIZE_OUT:-$CORRECTION_OUT}"
+    echo ""
+    echo "✓ Skalierung abgeschlossen. Ergebnis: $RESIZE_OUT"
+    read -rp "Weiter mit Enter ..."
+
+    # --- Schritt 3: Drucken (PHOTO_SRC_DIR gesetzt) ---
     echo ""
     echo "══ Schritt 3/3: Drucken ════════════════════════════════"
-    menu_print
+    PHOTO_SRC_DIR="$RESIZE_OUT" bash "$SCRIPT_DIR/photoprint.sh"
+
+    echo ""
+    read -rp "Workflow abgeschlossen. Weiter mit Enter ..."
 }
 
 # ---------------------------------------------------------------------------

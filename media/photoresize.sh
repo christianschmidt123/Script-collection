@@ -110,9 +110,14 @@ else
     MAGICK_CMD="convert"
 fi
 
-# Quellordner bestimmen
-read -rp "Quellordner mit Fotos (Enter = aktueller Ordner): " SRC_DIR
-SRC_DIR="${SRC_DIR:-.}"
+# Quellordner bestimmen (env-Variable PHOTO_SRC_DIR hat Vorrang)
+if [ -n "${PHOTO_SRC_DIR:-}" ]; then
+    SRC_DIR="$PHOTO_SRC_DIR"
+    echo "Quellordner (aus Workflow): $SRC_DIR"
+else
+    read -rp "Quellordner mit Fotos (Enter = aktueller Ordner): " SRC_DIR
+    SRC_DIR="${SRC_DIR:-.}"
+fi
 if [ ! -d "$SRC_DIR" ]; then
     echo "FEHLER: Ordner '$SRC_DIR' nicht gefunden."
     exit 1
