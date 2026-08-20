@@ -5,6 +5,7 @@ if [[ $# -lt 1 ]]; then
     exit 1
 fi
 
+PARALLEL_HASH_JOBS=4  # 3-4 Threads optimal für HDDs
 kept_count=0
 deleted_count=0
 errors_and_warnings=""
@@ -47,7 +48,6 @@ else
                     continue
                 fi
 
-                # Integritäts-Check (Größe >= 1MB + 1KB Header)
                 local_size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
 
                 if [[ -n "$local_size" && "$local_size" -ge 1048576 ]] && head -c 1024 "$file" &>/dev/null; then
@@ -110,7 +110,7 @@ else
 fi
 
 # ==============================================================================
-# STUFE 2: Inhaltsbasierte Prüfungen (Größe + MD5-Hash)
+# STUFE 2: Inhaltsbasierte Prüfungen (High-Speed 2-Phasen Hash)
 # ==============================================================================
 
 echo
@@ -121,7 +121,6 @@ find_with_size() {
     find "$@" -maxdepth 1 -type f -exec stat -f "%z	%N" {} + 2>/dev/null
 }
 
-# Kandidaten (Dateien mit identischer Byte-Größe) in temporären Speicher laden
 candidates=$(
     find_with_size "$@" | \
     sort -t$'\t' -k1,1n | \
@@ -140,54 +139,162 @@ candidates=$(
 
 total_hash_candidates=$(grep -c $'\t' <<< "$candidates")
 
-content_duplicates=""
+# Hash-Funktion mit variabler Read-Größe (128 KB oder 1 MB)
+chunk_hash() {
+    local line="$1"
+    local bytes="$2"
+    [[ -z "$line" ]] && return
+
+    local size file hash
+    size=$(echo "$line" | cut -f1)
+    file=$(echo "$line" | cut -f2-)
+
+    [[ -z "$file" || ! -f "$file" ]] && return
+
+    if command -v xxh128sum &>/dev/null; then
+        hash=$(head -c "$bytes" "$file" 2>/dev/null | xxh128sum | awk '{print $1}')
+    elif command -v xxhsum &>/dev/null; then
+        hash=$(head -c "$bytes" "$file" 2>/dev/null | xxhsum | awk '{print $1}')
+    else
+        hash=$(head -c "$bytes" "$file" 2>/dev/null | md5sum | awk '{print $1}')
+    fi
+
+    if [[ -n "$hash" ]]; then
+        echo -e "${hash}\t${size}\t${file}"
+    fi
+}
+export -f chunk_hash
+
+dup_files_to_delete=()
 
 if [[ -z "$candidates" || "$total_hash_candidates" -eq 0 ]]; then
     echo "[Stufe 2] Keine Dateien mit identischer Größe gefunden. Überspringe Hash-Prüfung."
 else
-    echo "Identische Größen gefunden für $total_hash_candidates Dateien. Starte Hash-Berechnung..."
-
-    processed_hash_files=0
-
-    # Kandidaten hashen und Fortschritt anzeigen
-    hashed_results=$(
-        while IFS=$'\t' read -r size file; do
-            [[ -z "$file" ]] && continue
-            
-            ((processed_hash_files++))
-            hash_percent=$(( processed_hash_files * 100 / total_hash_candidates ))
-            
-            # Ausgabe auf stderr (&2), damit es die Pipeline-Variable $hashed_results nicht verschmutzt
-            echo -ne "\r[Stufe 2] Berechne Hashes... [${hash_percent}%] (${processed_hash_files}/${total_hash_candidates})\033[K" >&2
-
-            hash=$(md5sum "$file" 2>/dev/null | awk '{print $1}')
-            if [[ -n "$hash" ]]; then
-                echo -e "${hash}\t${size}\t${file}"
-            fi
-        done <<< "$candidates"
+    echo "Identische Größen für $total_hash_candidates Dateien gefunden."
+    
+    # --- PHASE 1: Sensationell schneller 128KB Header-Hash ---
+    echo "[Stufe 2 - Phase 1/2] Ultra-Fast Header Check (128 KB) mit $PARALLEL_HASH_JOBS Threads..."
+    phase1_results=$(
+        printf "%s\n" "$candidates" | \
+        xargs -d '\n' -P "$PARALLEL_HASH_JOBS" -I {} bash -c 'chunk_hash "{}" 131072'
     )
-    echo -e "\r[Stufe 2] Berechne Hashes... [100%] Fertig!\033[K"
 
-    # Auswertung der Hash-Ergebnisse auf Duplikate
-    while read -r line; do
-        [[ -z "$line" ]] && continue
-        echo -e "\n$line"
-        content_duplicates+="$line"$'\n'
-    done < <(
-        echo "$hashed_results" | sort | awk -F'\t' '
-        BEGIN { prev_hash = "" }
+    # Nur die Dateien herausfiltern, die SELBST IM 128KB HEADER identisch sind
+    phase2_candidates=$(
+        echo "$phase1_results" | grep -v '^$' | sort -t$'\t' -k1,1 | awk -F'\t' '
+        BEGIN { prev_hash = ""; group = "" }
         {
-            hash = $1
-            size = $2
-            file = $3
-            
-            if (hash == prev_hash) {
-                print "  [INHALTLICHES DUPLIKAT GEFUNDEN] " file
+            if ($1 == prev_hash) {
+                if (group != "") { print group; group = "" }
+                print $2 "\t" $3
             } else {
-                prev_hash = hash
+                group = $2 "\t" $3
+                prev_hash = $1
             }
         }'
     )
+
+    total_p2_candidates=$(grep -c $'\t' <<< "$phase2_candidates")
+
+    if [[ -z "$phase2_candidates" || "$total_p2_candidates" -eq 0 ]]; then
+        echo "[Stufe 2] Keine echten Header-Kollisionen. Keine Duplikate vorhanden!"
+        final_hashed_results=""
+    else
+        # --- PHASE 2: Nur verbleibende Verdachtsfälle mit 1 MB verifizieren ---
+        echo "[Stufe 2 - Phase 2/2] Verifiziere $total_p2_candidates verbleibende Kandidaten (1 MB Check)..."
+        final_hashed_results=$(
+            printf "%s\n" "$phase2_candidates" | \
+            xargs -d '\n' -P "$PARALLEL_HASH_JOBS" -I {} bash -c 'chunk_hash "{}" 1048576'
+        )
+    fi
+
+    echo -e "[Stufe 2] Abgleich abgeschlossen!\033[K\n"
+
+    # Auswertung und Gruppen-Anzeige
+    current_hash=""
+    group_counter=0
+
+    echo "================================================"
+    echo "GEFUNDENE INHALTLICHE DUPLIKATE (STUFE 2)"
+    echo "================================================"
+
+    if [[ -n "$final_hashed_results" ]]; then
+        while IFS=$'\t' read -r hash size file; do
+            [[ -z "$file" ]] && continue
+
+            if [[ "$hash" != "$current_hash" ]]; then
+                current_hash="$hash"
+                ((group_counter++))
+                echo
+                echo "--- Gruppe $group_counter (Größe: $((size / 1024 / 1024)) MB) ---"
+                echo "  [REFERENZ - BEHALTEN] $file"
+            else
+                echo "  [DUPLIKAT - ZUM LÖSCHEN EMPFOHLEN] $file"
+                dup_files_to_delete+=("$file")
+            fi
+        done < <(
+            echo "$final_hashed_results" | grep -v '^$' | sort -t$'\t' -k1,1 -k2,2n | awk -F'\t' '
+            BEGIN { prev_hash = ""; group = "" }
+            {
+                if ($1 == prev_hash) {
+                    if (group != "") { print group; group = "" }
+                    print $0
+                } else {
+                    group = $0
+                    prev_hash = $1
+                }
+            }'
+        )
+    fi
+
+    echo "================================================"
+    echo
+
+    # Interaktives Löschmenü für Stufe 2
+    if [[ ${#dup_files_to_delete[@]} -gt 0 ]]; then
+        echo "Es wurden ${#dup_files_to_delete[@]} inhaltliche Duplikate in $group_counter Gruppen gefunden."
+        echo
+        echo "Wie möchtest du mit den inhaltlichen Duplikaten verfahren?"
+        echo "  [1] Alle gefundene Duplikate automatisch löschen (Referenz-Dateien bleiben erhalten)"
+        echo "  [2] Jede Duplikat-Datei einzeln bestätigen"
+        echo "  [3] Gar nichts löschen (nur anzeigen)"
+        echo
+        read -p "Deine Auswahl [1/2/3]: " choice < /dev/tty
+
+        case "$choice" in
+            1)
+                echo "Lösche ${#dup_files_to_delete[@]} inhaltliche Duplikate..."
+                for f in "${dup_files_to_delete[@]}"; do
+                    if rm -f -- "$f" 2>/dev/null; then
+                        echo "  [GELÖSCHT] $f"
+                        ((deleted_count++))
+                    else
+                        log_error "FEHLER: Konnte inhaltliches Duplikat nicht löschen: $f"
+                    fi
+                done
+                ;;
+            2)
+                for f in "${dup_files_to_delete[@]}"; do
+                    read -p "Soll '$f' gelöscht werden? [y/N]: " confirm < /dev/tty
+                    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                        if rm -f -- "$f" 2>/dev/null; then
+                            echo "  [GELÖSCHT] $f"
+                            ((deleted_count++))
+                        else
+                            log_error "FEHLER: Konnte $f nicht löschen."
+                        fi
+                    else
+                        echo "  [ÜBERSPRUNGEN] $f"
+                    fi
+                done
+                ;;
+            *)
+                echo "Keine inhaltlichen Duplikate gelöscht."
+                ;;
+        esac
+    else
+        echo "Keine inhaltlichen Duplikate gefunden."
+    fi
 fi
 
 # ==============================================================================
@@ -198,18 +305,9 @@ echo
 echo "================================================"
 echo "ZUSAMMENFASSUNG"
 echo "================================================"
-echo "$kept_count Dateien nach Namensschema behalten"
-echo "$deleted_count Dateien gelöscht"
+echo "$kept_count Dateien aus Stufe 1 behalten"
+echo "$deleted_count Dateien insgesamt gelöscht"
 echo
-
-if [[ -n "$content_duplicates" ]]; then
-    echo "Gefundene inhaltliche Duplikate (andere Namen, identischer Inhalt):"
-    echo -n "$content_duplicates"
-    echo
-else
-    echo "Keine zusätzlichen inhaltlichen Duplikate gefunden."
-    echo
-fi
 
 echo "Folgende Fehlermeldungen und Warnungen gab es:"
 if [[ -n "$errors_and_warnings" ]]; then
