@@ -1,0 +1,65 @@
+version: '3.8'
+
+services:
+  claude-code-ui:
+    image: libzonda/claudecodeui-docker:latest
+    container_name: claude-code-ui
+    restart: unless-stopped
+
+    working_dir: /workspace
+
+    entrypoint: ["/bin/sh", "-c"]
+
+    command:
+      - |
+        export PATH=$PATH:/usr/local/bin:/usr/bin
+
+        # 1. Verzeichnisse anlegen
+        mkdir -p /workspace/default-project /root/.claude/commands /usr/local/lib/node_modules/@cloudcli-ai/cloudcli
+        touch /usr/local/lib/node_modules/@cloudcli-ai/cloudcli/.env 2>/dev/null || true
+
+        # 2. Settings für Claude/Proxy konfigurieren
+        printf "%s\n" "{\"autoCompactPercent\":70,\"CLAUDE_AUTO_COMPACT_THRESHOLD\":\"90000\",\"env\":{\"ANTHROPIC_BASE_URL\":\"http://<YOUR_LOCAL_IP>:20128\",\"ANTHROPIC_AUTH_TOKEN\":\"<YOUR_TOKEN>\",\"ANTHROPIC_MODEL\":\"combo/gsd-planner\",\"ANTHROPIC_DEFAULT_OPUS_MODEL\":\"combo/gsd-planner\",\"ANTHROPIC_DEFAULT_SONNET_MODEL\":\"combo/gsd-coder\",\"ANTHROPIC_DEFAULT_HAIKU_MODEL\":\"combo/gsd-subagent\",\"ANTHROPIC_SMALL_FAST_MODEL\":\"combo/gsd-subagent\",\"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\":\"1\",\"CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT\":\"1\",\"CLAUDE_CODE_MAX_CONCURRENT_REQUESTS\":\"1\",\"HTTP_TIMEOUT\":\"300000\",\"API_TIMEOUT_MS\":\"300000\"}}" > /root/.claude/settings.json
+        cp /root/.claude/settings.json /root/.claude/config.json 2>/dev/null || true
+        git config --global url."https://github.com/".insteadOf ssh://git@github.com/
+
+        # 3. Claude Code installieren
+        if ! command -v claude >/dev/null 2>&1; then 
+          npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code --quiet
+        fi
+
+        # 4. GSD via offiziellem Installer für Claude registrieren
+        if [ ! -d "/root/.claude/skills" ] && [ ! -f "/root/.claude/commands/gsd-new-project.md" ]; then
+          npx --yes get-shit-done-cc@latest --claude --global || true
+        fi
+
+        # 5. CloudCLI starten
+        exec cloudcli
+
+    environment:
+      - HOST=0.0.0.0
+      - PORT=80
+      - SERVER_PORT=80
+      - DATABASE_PATH=/root/.cloudcli/auth.db
+      - ANTHROPIC_BASE_URL=http://<YOUR_LOCAL_IP>:20128
+      - ANTHROPIC_AUTH_TOKEN=<YOUR_TOKEN>
+      - NODE_ENV=production
+      - HOME=/root
+      - PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+    volumes:
+      - ./data/cloudcli:/root/.cloudcli
+      - ./data/claude:/root/.claude
+      - ./data/plugins:/root/.claude-code-ui
+      - ./data/projects:/workspace
+
+    networks:
+      mavlan_network:
+        ipv4_address: 192.168.0.xxx
+
+networks:
+  mavlan_network:
+    external: true
