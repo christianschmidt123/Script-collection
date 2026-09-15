@@ -1,39 +1,179 @@
+# ClaudeCodeUI / CloudCLI Stack für die AndroidApp-Weiterentwicklung
+# Läuft auf dem Portainer-Host (macvlan mit fester IPv4).
+#
+# Diese Datei definiert NUR den Entwicklungs-Container: ClaudeCodeUI +
+# komplette Build-/Test-Toolchain (.NET 10.0.111, MAUI-Workload, Android SDK,
+# Emulator/AVD, Appium, Claude CLI). Die App-Container (backend/db/web/…)
+# gehören NICHT hierher:
+#   - Integrationstests starten ihre Postgres/Redis-Container on demand per
+#     Testcontainers — dafür reicht der durchgereichte Docker-Socket.
+#   - Der App-Stack für E2E-/Manuell-Tests (docker-compose.yml im Repo) wird
+#     bei Bedarf von Hand bzw. aus Tests hochgefahren und danach wieder
+#     heruntergefahren.
+#
+# WICHTIG: Die Toolchain wird IDEMPOTENT IM STARTUP installiert — nicht im
+# Image. Ein Watchtower-Update des Base-Images kann damit nichts zerstören;
+# alles Persistente liegt in Volumes unter /mnt/Hdd4Tb/Datengrab/Docker/ClaudeCodeUI/.
+#
+# Backend-Erreichbarkeit aus der App im Emulator: Der Emulator nutzt KEIN
+# 10.0.2.2 (zeigt nur zum Container-Loopback). Läuft der App-Stack (aus dem
+# Repo-docker-compose.yml) auf dem Host, adressiert die Mobile-App ihn über
+# die Host-IP (API_BASE_URL_OVERRIDE, Standard: der Portainer-Host selbst).
 version: '3.8'
 
 services:
   claude-code-ui:
-    image: libzonda/claudecodeui-docker:latest
     container_name: claude-code-ui
     restart: unless-stopped
-
     working_dir: /workspace
+
+    # Image bleibt minimal — alle Installationen passieren im Startup (Watchtower-sicher)
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM libzonda/claudecodeui-docker:latest
+
+        # Nur Laufzeit-Bibliotheken, die dotnet und der Emulator brauchen (kein SDK-Zeug)
+        RUN apt-get update && apt-get install -y --no-install-recommends \
+            wget curl unzip xz-utils git ca-certificates procps \
+            openjdk-17-jdk-headless \
+            libx11-6 libxcb1 libxau6 libxdmcp6 libglib2.0-0 \
+            libnss3 libgl1 libpulse0 libasound2 \
+            qemu-kvm libvirt-clients bridge-utils \
+            && rm -rf /var/lib/apt/lists/* \
+        # libicu heißt je nach Debian-Release anders (12: libicu72, 13: libicu76)
+        && (apt-get install -y --no-install-recommends libicu76 \
+            || apt-get install -y --no-install-recommends libicu72 \
+            || apt-get install -y --no-install-recommends libicu-dev)
+
+    # Hardware-Durchreichung: KVM (CPU-Virtualisierung) + GPU (Host-Rendering)
+    devices:
+      - /dev/kvm:/dev/kvm
+      # GPU-Adapter für hardwarebeschleunigtes Emulator-Rendering (-gpu host)
+      - /dev/dri:/dev/dri
+
+    # Inter-Prozess-Kommunikation für Emulator/Performance
+    ipc: host
+    privileged: false
 
     entrypoint: ["/bin/sh", "-c"]
 
     command:
       - |
-        export PATH=$PATH:/usr/local/bin:/usr/bin
+        set -e
+        # PATH hart setzen — das Base-Image kann beim Start die Environment
+        # zuruecksetzen (Symptom war "grep: not found" + Install nach /dotnet).
+        export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        TOOLCHAIN=/opt/toolchain
+        mkdir -p "$$TOOLCHAIN/bin" /root/.claude/commands
 
-        # 1. Verzeichnisse anlegen
-        mkdir -p /workspace/default-project /root/.claude/commands /usr/local/lib/node_modules/@cloudcli-ai/cloudcli
-        touch /usr/local/lib/node_modules/@cloudcli-ai/cloudcli/.env 2>/dev/null || true
+        # ---------------------------------------------------------------
+        # 1. .NET SDK 10.0.111 (exakt der global.json-Pin; Channel-Latest
+        #    würde 10.0.112 ziehen und bricht mit MSB4242) — ins Volume.
+        # ---------------------------------------------------------------
+        # Funktionstest statt nur Datei-Check: ein halb entpacktes SDK ist
+        # zwar ausfuehrbar, aber kaputt — dotnet --info muss antworten.
+        if ! "$$TOOLCHAIN/dotnet/dotnet" --info >/dev/null 2>&1; then
+          rm -rf "$$TOOLCHAIN/dotnet"
+          wget -q https://dot.net/v1/dotnet-install.sh -O /tmp/dotnet-install.sh
+          chmod +x /tmp/dotnet-install.sh
+          /tmp/dotnet-install.sh --version 10.0.111 --install-dir "$$TOOLCHAIN/dotnet"
+          rm /tmp/dotnet-install.sh
+        fi
+        export DOTNET_ROOT="$$TOOLCHAIN/dotnet"
+        export PATH="$$PATH:$$DOTNET_ROOT:$$DOTNET_ROOT/tools"
+        # Fehlgeplante SDK-Kopie aus frueheren Laeufen mit kaputtem PATH aufräumen
+        if [ -d /dotnet ] && [ ! -x "$$DOTNET_ROOT/dotnet" ]; then
+          mv /dotnet "$$DOTNET_ROOT" 2>/dev/null || rm -rf /dotnet
+        fi
+        rm -rf /dotnet
 
-        # 2. Settings für Claude/Proxy konfigurieren
-        printf "%s\n" "{\"autoCompactPercent\":70,\"CLAUDE_AUTO_COMPACT_THRESHOLD\":\"90000\",\"env\":{\"ANTHROPIC_BASE_URL\":\"http://<YOUR_LOCAL_IP>:20128\",\"ANTHROPIC_AUTH_TOKEN\":\"<YOUR_TOKEN>\",\"ANTHROPIC_MODEL\":\"combo/gsd-planner\",\"ANTHROPIC_DEFAULT_OPUS_MODEL\":\"combo/gsd-planner\",\"ANTHROPIC_DEFAULT_SONNET_MODEL\":\"combo/gsd-coder\",\"ANTHROPIC_DEFAULT_HAIKU_MODEL\":\"combo/gsd-subagent\",\"ANTHROPIC_SMALL_FAST_MODEL\":\"combo/gsd-subagent\",\"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\":\"1\",\"CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT\":\"1\",\"CLAUDE_CODE_MAX_CONCURRENT_REQUESTS\":\"1\",\"HTTP_TIMEOUT\":\"300000\",\"API_TIMEOUT_MS\":\"300000\"}}" > /root/.claude/settings.json
+        # Android-Workload (Linux: kein kombinierter "maui"-Workload, nur
+        # android) — Pflicht für net10.0-android36.1 (AndroidApp.Mobile);
+        # iOS/MacCatalyst sind unter Linux ohnehin nicht buildbar.
+        if ! dotnet workload list 2>/dev/null | grep -qE '^ *android '; then
+          dotnet workload install android
+        fi
+
+        # ---------------------------------------------------------------
+        # 2. Android SDK Command-Line Tools, Emulator & System-Image API 36
+        # ---------------------------------------------------------------
+        export ANDROID_SDK_ROOT=/opt/android-sdk
+        export PATH="$$PATH:$$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$$ANDROID_SDK_ROOT/platform-tools:$$ANDROID_SDK_ROOT/emulator"
+        if [ ! -d "$$ANDROID_SDK_ROOT/cmdline-tools/latest" ]; then
+          mkdir -p "$$ANDROID_SDK_ROOT/cmdline-tools"
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O /tmp/cmdline-tools.zip
+          unzip -q /tmp/cmdline-tools.zip -d "$$ANDROID_SDK_ROOT/cmdline-tools"
+          mv "$$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          rm /tmp/cmdline-tools.zip
+        fi
+        if ! sdkmanager --list_installed 2>/dev/null | grep -q "platforms;android-36.1"; then
+          yes | sdkmanager --licenses > /dev/null
+          sdkmanager "platform-tools" "platforms;android-36.1" "build-tools;36.0.0" \
+                     "emulator" "system-images;android-36;google_apis;x86_64"
+        fi
+
+        # ---------------------------------------------------------------
+        # 3. Claude Code Settings & Proxy festlegen
+        # ---------------------------------------------------------------
+        printf "%s\n" "{\"autoCompactPercent\":70,\"CLAUDE_AUTO_COMPACT_THRESHOLD\":\"90000\",\"env\":{\"PATH\":\"/opt/toolchain/dotnet:/opt/toolchain/dotnet/tools:/opt/android-sdk/platform-tools:/opt/android-sdk/emulator:/opt/android-sdk/cmdline-tools/latest/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\",\"DOTNET_ROOT\":\"/opt/toolchain/dotnet\",\"ANDROID_SDK_ROOT\":\"/opt/android-sdk\",\"JAVA_HOME\":\"/usr/lib/jvm/java-17-openjdk-amd64\",\"ANTHROPIC_BASE_URL\":\"http://<YOUR_LOCAL_IP>:20128\",\"ANTHROPIC_AUTH_TOKEN\":\"<YOUR_TOKEN>\",\"ANTHROPIC_MODEL\":\"combo/gsd-planner\",\"ANTHROPIC_DEFAULT_OPUS_MODEL\":\"combo/gsd-planner\",\"ANTHROPIC_DEFAULT_SONNET_MODEL\":\"combo/gsd-coder\",\"ANTHROPIC_DEFAULT_HAIKU_MODEL\":\"combo/gsd-subagent\",\"ANTHROPIC_SMALL_FAST_MODEL\":\"combo/gsd-subagent\",\"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\":\"1\",\"CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT\":\"1\",\"CLAUDE_CODE_MAX_CONCURRENT_REQUESTS\":\"1\",\"HTTP_TIMEOUT\":\"300000\",\"API_TIMEOUT_MS\":\"300000\"}}" > /root/.claude/settings.json
         cp /root/.claude/settings.json /root/.claude/config.json 2>/dev/null || true
         git config --global url."https://github.com/".insteadOf ssh://git@github.com/
 
-        # 3. Claude Code installieren
-        if ! command -v claude >/dev/null 2>&1; then 
+        # 4. Gitea-Credentials (Token) persistent ablegen
+        printf "http://admin:<YOUR_TOKEN>@<YOUR_LOCAL_IP>:3000\n" > /root/.git-credentials
+        git config --global credential.helper store
+
+        # 5. Projekt klonen (idempotent) — existiert das Verzeichnis ohne .git
+        #    (abgebrochener Clone), wird es geräumt; ein vorhandenes Repo wird
+        #    nicht angefasst, nur aktualisiert (kein loeschen von User-Arbeit).
+        if [ -d /workspace/shoppinglist ] && [ ! -d /workspace/shoppinglist/.git ]; then
+          rm -rf /workspace/shoppinglist
+        fi
+        if [ ! -d /workspace/shoppinglist/.git ]; then
+          git clone http://<YOUR_LOCAL_IP>:3000/admin/shoppinglist.git /workspace/shoppinglist
+        else
+          git -C /workspace/shoppinglist pull --ff-only || true
+        fi
+
+        # 6. Claude Code CLI installieren (inkl. allow-scripts)
+        if ! command -v claude >/dev/null 2>&1; then
           npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code --quiet
         fi
 
-        # 4. GSD via offiziellem Installer für Claude registrieren
+        # 7. GSD via Installer registrieren
         if [ ! -d "/root/.claude/skills" ] && [ ! -f "/root/.claude/commands/gsd-new-project.md" ]; then
           npx --yes get-shit-done-cc@latest --claude --global || true
         fi
 
-        # 5. CloudCLI starten
+        # 7b. Appium + UIAutomator2-Treiber für AndroidApp.UITests /
+        #     Mobile.IntegrationTests (Node ist im Base-Image vorhanden)
+        if ! command -v appium >/dev/null 2>&1; then
+          npm install -g --quiet appium && appium driver install uiautomator2 || true
+        fi
+
+        # 8. Android-AVD anlegen (idempotent) — entspricht dem Runbook "MAUI_Emulator_API_36"
+        # AVD-Check: config.ini + Ini-Sidecar + nicht-leere config.ini.
+        # (system.img.qcow2 entsteht erst beim ersten Boot und darf nicht
+        # Teil des Guards sein, sonst wird jede frische AVD weggeschmissen.)
+        AVD_DIR=/root/.android/avd/MAUI_Emulator_API_36.avd
+        if [ ! -s "$$AVD_DIR/config.ini" ] || [ ! -f /root/.android/avd/MAUI_Emulator_API_36.ini ]; then
+          rm -rf /root/.android/avd/MAUI_Emulator_API_36.avd /root/.android/avd/MAUI_Emulator_API_36.ini
+          echo no | avdmanager create avd -n MAUI_Emulator_API_36 \
+            -k "system-images;android-36;google_apis;x86_64" -d pixel_6
+        fi
+
+        # 9. Emulator headless starten — KVM (CPU) + Host-GPU (Grafik)
+        #    -gpu host nutzt den durchgereichten /dev/dri-Adapter; auf Rechnern
+        #    ohne funktionierendes DRI fällt der Emulator automatisch auf
+        #    swiftshader_indirect zurück (Boot-Log zeigt die gewählte Option).
+        if ! adb devices | grep -q emulator; then
+          nohup emulator -avd MAUI_Emulator_API_36 \
+            -no-window -gpu host -no-audio -no-boot-anim \
+            -accel on > /workspace/emulator.log 2>&1 &
+        fi
+
+        # 10. CloudCLI starten
         exec cloudcli
 
     environment:
@@ -45,20 +185,43 @@ services:
       - ANTHROPIC_AUTH_TOKEN=<YOUR_TOKEN>
       - NODE_ENV=production
       - HOME=/root
-      - PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      # Toolchain-Pfade dauerhaft exportieren, damit Claude-Shell-Sessions sie
+      # erben (sonst braucht jeder dotnet-Build manuell -p:AndroidSdkDirectory=...)
+      - JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+      - ANDROID_SDK_ROOT=/opt/android-sdk
+      - DOTNET_ROOT=/opt/toolchain/dotnet
+      - PATH=/opt/toolchain/dotnet:/opt/toolchain/dotnet/tools:/opt/android-sdk/platform-tools:/opt/android-sdk/emulator:/opt/android-sdk/cmdline-tools/latest/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      # Testcontainers: Docker-Socket des Hosts (siehe volumes:)
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      # Appium/Pfad für die UI-Test-Suites (UITestFixture prüft NODE_BINARY_PATH)
+      - NODE_BINARY_PATH=/usr/bin/node
+      # Mobile-Override: Adresse des App-Backends (docker-compose.yml-Stack auf
+      # dem Host) aus der App im Emulator. CCUI_HOST_IP = IP des Portainer-Hosts
+      # (TrueNAS <YOUR_LOCAL_IP>, mehrere Dienste); der App-Stack muss dafür
+      # laufen (docker compose up im Repo).
+      - API_BASE_URL_OVERRIDE=http://${CCUI_HOST_IP:-<YOUR_LOCAL_IP>}:8081
 
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
 
     volumes:
-      - ./data/cloudcli:/root/.cloudcli
-      - ./data/claude:/root/.claude
-      - ./data/plugins:/root/.claude-code-ui
-      - ./data/projects:/workspace
+      # Docker-Socket für Testcontainers (Integrationstests starten eigene
+      # Postgres/Redis-Container on demand). Read-write nötig — Testcontainers
+      # erzeugt Container/Netzwerke.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /mnt/Hdd4Tb/Datengrab/Docker/ClaudeCodeUI/cloudcli:/root/.cloudcli
+      - /mnt/Hdd4Tb/Datengrab/Docker/ClaudeCodeUI/claude:/root/.claude
+      - /mnt/Hdd4Tb/Datengrab/Docker/ClaudeCodeUI/plugins:/root/.claude-code-ui
+      - /mnt/Hdd4Tb/Datengrab/Docker/ClaudeCodeUI/projects:/workspace
+      - /mnt/Hdd4Tb/Datengrab/Docker/ClaudeCodeUI/android-sdk:/opt/android-sdk
+      # .NET SDK + MAUI-Workload persistent (Startup installiert hierher)
+      - /mnt/Hdd4Tb/Datengrab/Docker/ClaudeCodeUI/dotnet:/opt/toolchain/dotnet
+      # AVD-Zustand persistent halten
+      - /mnt/Hdd4Tb/Datengrab/Docker/ClaudeCodeUI/android-avd:/root/.android
 
     networks:
       mavlan_network:
-        ipv4_address: 192.168.0.xxx
+        ipv4_address: ${CCUI_IP:-<YOUR_LOCAL_IP>}
 
 networks:
   mavlan_network:
