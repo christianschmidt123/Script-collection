@@ -5,39 +5,110 @@ if [[ $# -lt 1 ]]; then
     exit 1
 fi
 
-PARALLEL_HASH_JOBS=4  # 3-4 Threads optimal für HDDs
+PARALLEL_HASH_JOBS=4          # 3-4 Threads optimal für HDDs, mehr für SSDs
+HASH_BATCH_SIZE=50            # Dateien pro bash -c Aufruf
+USE_TWO_PHASE_HASH=1          # 1 = 128KB-Header-Check vor Vollhash, 0 = direkt voll hashen
+PHASE1_BYTES=131072           # 128 KB
+PHASE2_BYTES=1048576          # 1 MB
+MIN_SIZE_BYTES=1048576        # 1 MB - kleinere Dateien gelten als defekt in Stufe 1
+
 kept_count=0
 deleted_count=0
 errors_and_warnings=""
 
 log_error() {
-    local msg="$1"
-    errors_and_warnings+="$msg"$'\n'
+    errors_and_warnings+="$1"$'\n'
 }
 
+# Temporäre Dateien anlegen und bei Exit aufräumen
+SCAN_FILE=$(mktemp -t mediadup_scan.XXXXXX)
+PHASE1_FILE=$(mktemp -t mediadup_p1.XXXXXX)
+PHASE2_FILE=$(mktemp -t mediadup_p2.XXXXXX)
+FINAL_FILE=$(mktemp -t mediadup_final.XXXXXX)
+trap 'rm -f "$SCAN_FILE" "$PHASE1_FILE" "$PHASE2_FILE" "$FINAL_FILE"' EXIT
+
 # ==============================================================================
-# STUFE 1: Dateisystem scannen und nach Namen & Auflösung bereinigen
+# VORBEREITUNG: Dateisystem EINMAL scannen
 # ==============================================================================
 
-echo -n "Zähle Quelldateien..."
-total_files=$(find "$@" -maxdepth 1 -type f -name "*_[0-9]*p*" 2>/dev/null | wc -l | tr -d ' ')
-echo -e "\rGefundene Dateien für Stufe 1: $total_files"
+echo "Scanne Dateisystem (rekursiv)..."
 
-if [[ -z "$total_files" || "$total_files" -eq 0 ]]; then
+# Eine Zeile pro Datei: <size>\t<path>
+# GNU find bevorzugt, BSD-Fallback via stat
+if find "$@" -type f -printf '%s\t%p\n' > "$SCAN_FILE" 2>/dev/null; then
+    :
+else
+    # BSD/macOS Fallback
+    find "$@" -type f -exec stat -f "%z %N" {} + > "$SCAN_FILE" 2>/dev/null
+fi
+
+total_scanned=$(wc -l < "$SCAN_FILE" | tr -d ' ')
+echo "Insgesamt $total_scanned Dateien gefunden (rekursiv)."
+echo
+
+if [[ "$total_scanned" -eq 0 ]]; then
+    echo "Keine Dateien gefunden. Abbruch."
+    exit 0
+fi
+
+# ==============================================================================
+# STUFE 1: Nach Namen & Auflösung bereinigen (nur Dateien mit _<Zahl>p im Namen)
+# ==============================================================================
+
+echo "[Stufe 1] Filtere nach Namensmuster *_<Zahl>p*..."
+
+# Kandidaten aus Scan-Datei extrahieren: nur der Pfad (Spalte 2)
+# Muster: Dateiname enthält _<Zahl>p
+awk -F'\t' '
+{
+    path = $2
+    n = split(path, parts, "/")
+    filename = parts[n]
+
+    if (match(filename, /_[0-9]+p/)) {
+        res_str = substr(filename, RSTART, RLENGTH)
+        gsub(/[^0-9]/, "", res_str)
+        base = substr(filename, 1, RSTART - 1)
+        if (base != "" && res_str != "") {
+            print base "\t" res_str "\t" path
+        }
+    }
+}
+' "$SCAN_FILE" > "$PHASE1_FILE"
+
+total_files=$(wc -l < "$PHASE1_FILE" | tr -d ' ')
+echo "Gefundene Dateien für Stufe 1: $total_files"
+
+if [[ "$total_files" -eq 0 ]]; then
     echo "Keine passenden Dateien mit Auflösungsmuster (_<Zahl>p) gefunden."
 else
+    # Sortieren: Basisname aufsteigend, Auflösung absteigend (höchste zuerst)
+    # Danach mit \0 als Gruppentrenner ausgeben
+    sorted_grouped=$(
+        sort -t$'\t' -k1,1 -k2,2nr "$PHASE1_FILE" | \
+        awk -F'\t' '
+        BEGIN { prev = "" }
+        {
+            if (NR > 1 && $1 != prev) printf "\0"
+            printf "%s\t%s\n", $2, $3
+            prev = $1
+        }
+        END { if (NR > 0) printf "\0" }
+        '
+    )
+
     processed_files=0
 
     while IFS= read -r -d '' group_block; do
         [[ -z "$group_block" ]] && continue
 
-        file_count=$(grep -c $'\t' <<< "$group_block")
+        file_count=$(wc -l <<< "$group_block" | tr -d ' ')
         best_found=0
 
         ((processed_files += file_count))
         percent=$(( processed_files * 100 / total_files ))
-        
-        echo -ne "\r[Stufe 1] Verarbeite Dateisystem... [${percent}%] (${processed_files}/${total_files})\033[K"
+
+        echo -ne "\r[Stufe 1] Verarbeite... [${percent}%] (${processed_files}/${total_files})\033[K"
 
         while IFS=$'\t' read -r res file; do
             [[ -z "$file" ]] && continue
@@ -50,16 +121,16 @@ else
 
                 local_size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
 
-                if [[ -n "$local_size" && "$local_size" -ge 1048576 ]] && head -c 1024 "$file" &>/dev/null; then
+                if [[ -n "$local_size" && "$local_size" -ge "$MIN_SIZE_BYTES" ]] && head -c 1024 "$file" &>/dev/null; then
                     if (( file_count > 1 )); then
                         echo -e "\n  [BEHALTEN] $file (${res}p)"
                     fi
                     best_found=1
-                    ((kept_count++))
+                    ((kept_count++)) || true
                 else
                     echo -e "\n  [DEFEKT - LÖSCHEN] $file"
                     if rm -f -- "$file" 2>/dev/null; then
-                        ((deleted_count++))
+                        ((deleted_count++)) || true
                     else
                         log_error "FEHLER: Konnte defekte Datei nicht löschen: $file"
                     fi
@@ -68,7 +139,7 @@ else
                 if [[ -f "$file" ]]; then
                     echo -e "\n  [DUPLIKAT - LÖSCHEN] $file"
                     if rm -f -- "$file" 2>/dev/null; then
-                        ((deleted_count++))
+                        ((deleted_count++)) || true
                     else
                         log_error "FEHLER: Konnte Duplikat nicht löschen: $file"
                     fi
@@ -76,112 +147,86 @@ else
             fi
         done <<< "$group_block"
 
-    done < <(
-        find "$@" -maxdepth 1 -type f -name "*_[0-9]*p*" 2>/dev/null | \
-        awk '{
-            path = $0
-            n = split(path, parts, "/")
-            filename = parts[n]
-            
-            if (match(filename, /_[0-9]+p/)) {
-                res_str = substr(filename, RSTART, RLENGTH)
-                gsub(/[^0-9]/, "", res_str)
-                base = substr(filename, 1, RSTART - 1)
-                
-                if (base != "" && res_str != "") {
-                    print base "\t" res_str "\t" path
-                }
-            }
-        }' | \
-        sort -t$'\t' -k1,1 -k2,2nr | \
-        awk -F'\t' '
-        BEGIN { prev = "" }
-        {
-            if (NR > 1 && $1 != prev) {
-                printf "\0"
-            }
-            printf "%s\t%s\n", $2, $3
-            prev = $1
-        }
-        END { if (NR > 0) printf "\0" }
-        '
-    )
-    echo -e "\r[Stufe 1] Verarbeite Dateisystem... [100%] Fertig!\033[K"
+    done < <(printf '%s' "$sorted_grouped")
+
+    echo -e "\r[Stufe 1] Verarbeite... [100%] Fertig!\033[K"
 fi
 
 # ==============================================================================
-# STUFE 2: Inhaltsbasierte Prüfungen (High-Speed 2-Phasen Hash)
+# STUFE 2: Inhaltsbasierte Prüfungen
 # ==============================================================================
 
 echo
 echo "[Stufe 2] Filter auf exakt gleich große Dateien..."
 
-find_with_size() {
-    find "$@" -maxdepth 1 -type f -printf '%s\t%p\n' 2>/dev/null || \
-    find "$@" -maxdepth 1 -type f -exec stat -f "%z	%N" {} + 2>/dev/null
+# Aus Scan-Datei nur Größen mit >= 2 Vorkommen extrahieren
+# Format: <size>\t<path>
+candidates_file=$(mktemp -t mediadup_cand.XXXXXX)
+trap 'rm -f "$SCAN_FILE" "$PHASE1_FILE" "$PHASE2_FILE" "$FINAL_FILE" "$candidates_file"' EXIT
+
+sort -t$'\t' -k1,1n "$SCAN_FILE" | awk -F'\t' '
+BEGIN { prev_size = ""; saved = "" }
+{
+    if ($1 == prev_size) {
+        if (saved != "") { print saved; saved = "" }
+        print $0
+    } else {
+        saved = $0
+        prev_size = $1
+    }
 }
+' > "$candidates_file"
 
-candidates=$(
-    find_with_size "$@" | \
-    sort -t$'\t' -k1,1n | \
-    awk -F'\t' '
-    BEGIN { prev_size = ""; saved = "" }
-    {
-        if ($1 == prev_size) {
-            if (saved != "") { print saved; saved = "" }
-            print $0
-        } else {
-            saved = $0
-            prev_size = $1
-        }
-    }'
-)
+total_hash_candidates=$(wc -l < "$candidates_file" | tr -d ' ')
 
-total_hash_candidates=$(grep -c $'\t' <<< "$candidates")
-
-# Hash-Funktion mit variabler Read-Größe (128 KB oder 1 MB)
+# Hash-Funktion mit variabler Read-Größe
+# Wird via xargs batched aufgerufen
 chunk_hash() {
-    local line="$1"
-    local bytes="$2"
-    [[ -z "$line" ]] && return
+    local bytes="$1"
+    shift
+    local line size file hash
 
-    local size file hash
-    size=$(echo "$line" | cut -f1)
-    file=$(echo "$line" | cut -f2-)
+    for line in "$@"; do
+        [[ -z "$line" ]] && continue
 
-    [[ -z "$file" || ! -f "$file" ]] && return
+        size=$(cut -f1 <<< "$line")
+        file=$(cut -f2- <<< "$line")
 
-    if command -v xxh128sum &>/dev/null; then
-        hash=$(head -c "$bytes" "$file" 2>/dev/null | xxh128sum | awk '{print $1}')
-    elif command -v xxhsum &>/dev/null; then
-        hash=$(head -c "$bytes" "$file" 2>/dev/null | xxhsum | awk '{print $1}')
-    else
-        hash=$(head -c "$bytes" "$file" 2>/dev/null | md5sum | awk '{print $1}')
-    fi
+        [[ -z "$file" || ! -f "$file" ]] && continue
 
-    if [[ -n "$hash" ]]; then
-        echo -e "${hash}\t${size}\t${file}"
-    fi
+        if command -v xxh128sum &>/dev/null; then
+            hash=$(head -c "$bytes" "$file" 2>/dev/null | xxh128sum | awk '{print $1}')
+        elif command -v xxhsum &>/dev/null; then
+            hash=$(head -c "$bytes" "$file" 2>/dev/null | xxhsum | awk '{print $1}')
+        else
+            hash=$(head -c "$bytes" "$file" 2>/dev/null | md5sum | awk '{print $1}')
+        fi
+
+        if [[ -n "$hash" ]]; then
+            printf '%s\t%s\t%s\n' "$hash" "$size" "$file"
+        fi
+    done
 }
 export -f chunk_hash
 
 dup_files_to_delete=()
 
-if [[ -z "$candidates" || "$total_hash_candidates" -eq 0 ]]; then
+if [[ "$total_hash_candidates" -eq 0 ]]; then
     echo "[Stufe 2] Keine Dateien mit identischer Größe gefunden. Überspringe Hash-Prüfung."
 else
     echo "Identische Größen für $total_hash_candidates Dateien gefunden."
-    
-    # --- PHASE 1: Sensationell schneller 128KB Header-Hash ---
-    echo "[Stufe 2 - Phase 1/2] Ultra-Fast Header Check (128 KB) mit $PARALLEL_HASH_JOBS Threads..."
-    phase1_results=$(
-        printf "%s\n" "$candidates" | \
-        xargs -d '\n' -P "$PARALLEL_HASH_JOBS" -I {} bash -c 'chunk_hash "{}" 131072'
-    )
 
-    # Nur die Dateien herausfiltern, die SELBST IM 128KB HEADER identisch sind
-    phase2_candidates=$(
-        echo "$phase1_results" | grep -v '^$' | sort -t$'\t' -k1,1 | awk -F'\t' '
+    if [[ "$USE_TWO_PHASE_HASH" -eq 1 ]]; then
+        # --- PHASE 1: 128 KB Header-Hash ---
+        echo "[Stufe 2 - Phase 1/2] Ultra-Fast Header Check (128 KB) mit $PARALLEL_HASH_JOBS Threads..."
+
+        # Batch-Verarbeitung: alle Zeilen an einen bash -c Aufruf übergeben
+        xargs -d '\n' -P "$PARALLEL_HASH_JOBS" -n "$HASH_BATCH_SIZE" \
+            bash -c 'chunk_hash "$0" "$@"' "$PHASE1_BYTES" \
+            < "$candidates_file" > "$PHASE1_FILE"
+
+        # Nur Dateien behalten, die im 128KB-Header identisch sind (>= 2 pro Hash)
+        sort -t$'\t' -k1,1 "$PHASE1_FILE" | awk -F'\t' '
         BEGIN { prev_hash = ""; group = "" }
         {
             if ($1 == prev_hash) {
@@ -191,24 +236,31 @@ else
                 group = $2 "\t" $3
                 prev_hash = $1
             }
-        }'
-    )
+        }
+        ' > "$PHASE2_FILE"
 
-    total_p2_candidates=$(grep -c $'\t' <<< "$phase2_candidates")
+        total_p2_candidates=$(wc -l < "$PHASE2_FILE" | tr -d ' ')
 
-    if [[ -z "$phase2_candidates" || "$total_p2_candidates" -eq 0 ]]; then
-        echo "[Stufe 2] Keine echten Header-Kollisionen. Keine Duplikate vorhanden!"
-        final_hashed_results=""
+        if [[ "$total_p2_candidates" -eq 0 ]]; then
+            echo "[Stufe 2] Keine echten Header-Kollisionen. Keine Duplikate vorhanden!"
+            : > "$FINAL_FILE"
+        else
+            # --- PHASE 2: 1 MB Verify ---
+            echo "[Stufe 2 - Phase 2/2] Verifiziere $total_p2_candidates verbleibende Kandidaten (1 MB Check)..."
+            xargs -d '\n' -P "$PARALLEL_HASH_JOBS" -n "$HASH_BATCH_SIZE" \
+                bash -c 'chunk_hash "$0" "$@"' "$PHASE2_BYTES" \
+                < "$PHASE2_FILE" > "$FINAL_FILE"
+        fi
     else
-        # --- PHASE 2: Nur verbleibende Verdachtsfälle mit 1 MB verifizieren ---
-        echo "[Stufe 2 - Phase 2/2] Verifiziere $total_p2_candidates verbleibende Kandidaten (1 MB Check)..."
-        final_hashed_results=$(
-            printf "%s\n" "$phase2_candidates" | \
-            xargs -d '\n' -P "$PARALLEL_HASH_JOBS" -I {} bash -c 'chunk_hash "{}" 1048576'
-        )
+        # --- DIREKT: Vollhash (schneller bei SSDs oder wenn xxh128 verfügbar) ---
+        echo "[Stufe 2] Direkter Vollhash mit $PARALLEL_HASH_JOBS Threads..."
+        # Größe = ganze Datei: wir nutzen eine sehr große Zahl, head liest bis EOF
+        xargs -d '\n' -P "$PARALLEL_HASH_JOBS" -n "$HASH_BATCH_SIZE" \
+            bash -c 'chunk_hash "$0" "$@"' "9999999999999" \
+            < "$candidates_file" > "$FINAL_FILE"
     fi
 
-    echo -e "[Stufe 2] Abgleich abgeschlossen!\033[K\n"
+    echo "[Stufe 2] Abgleich abgeschlossen!"
 
     # Auswertung und Gruppen-Anzeige
     current_hash=""
@@ -218,13 +270,13 @@ else
     echo "GEFUNDENE INHALTLICHE DUPLIKATE (STUFE 2)"
     echo "================================================"
 
-    if [[ -n "$final_hashed_results" ]]; then
+    if [[ -s "$FINAL_FILE" ]]; then
         while IFS=$'\t' read -r hash size file; do
             [[ -z "$file" ]] && continue
 
             if [[ "$hash" != "$current_hash" ]]; then
                 current_hash="$hash"
-                ((group_counter++))
+                ((group_counter++)) || true
                 echo
                 echo "--- Gruppe $group_counter (Größe: $((size / 1024 / 1024)) MB) ---"
                 echo "  [REFERENZ - BEHALTEN] $file"
@@ -233,7 +285,7 @@ else
                 dup_files_to_delete+=("$file")
             fi
         done < <(
-            echo "$final_hashed_results" | grep -v '^$' | sort -t$'\t' -k1,1 -k2,2n | awk -F'\t' '
+            sort -t$'\t' -k1,1 -k2,2n "$FINAL_FILE" | awk -F'\t' '
             BEGIN { prev_hash = ""; group = "" }
             {
                 if ($1 == prev_hash) {
@@ -250,7 +302,7 @@ else
     echo "================================================"
     echo
 
-    # Interaktives Löschmenü für Stufe 2
+    # Interaktives Löschmenü
     if [[ ${#dup_files_to_delete[@]} -gt 0 ]]; then
         echo "Es wurden ${#dup_files_to_delete[@]} inhaltliche Duplikate in $group_counter Gruppen gefunden."
         echo
@@ -267,7 +319,7 @@ else
                 for f in "${dup_files_to_delete[@]}"; do
                     if rm -f -- "$f" 2>/dev/null; then
                         echo "  [GELÖSCHT] $f"
-                        ((deleted_count++))
+                        ((deleted_count++)) || true
                     else
                         log_error "FEHLER: Konnte inhaltliches Duplikat nicht löschen: $f"
                     fi
@@ -279,7 +331,7 @@ else
                     if [[ "$confirm" =~ ^[Yy]$ ]]; then
                         if rm -f -- "$f" 2>/dev/null; then
                             echo "  [GELÖSCHT] $f"
-                            ((deleted_count++))
+                            ((deleted_count++)) || true
                         else
                             log_error "FEHLER: Konnte $f nicht löschen."
                         fi
